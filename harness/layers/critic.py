@@ -78,17 +78,75 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def _try_split_contradiction(self, text: str, ctx) -> list[dict] | None:
+        delim = " và "
+        pos = 0
+        while True:
+            pos = text.find(delim, pos)
+            if pos == -1:
+                break
+            head = text[:pos]
+            tail = text[pos + len(delim):]
+            if head and tail and ctx.saw(head) and ctx.saw(tail):
+                doc_head = None
+                doc_tail = None
+                if ctx.corpus:
+                    for doc in ctx.corpus.docs:
+                        if doc.doc_id in ctx.observed_text or doc.body in ctx.observed_text:
+                            if doc_head is None and head in doc.body:
+                                doc_head = doc.doc_id
+                            if doc_tail is None and tail in doc.body:
+                                doc_tail = doc.doc_id
+                    if not (doc_head and doc_tail):
+                        for doc in ctx.corpus.docs:
+                            if doc_head is None and head in doc.body:
+                                doc_head = doc.doc_id
+                            if doc_tail is None and tail in doc.body:
+                                doc_tail = doc.doc_id
+                if doc_head and doc_tail and doc_head != doc_tail:
+                    return [
+                        {"text": head, "doc_id": doc_head},
+                        {"text": tail, "doc_id": doc_tail},
+                    ]
+            pos += 1
+        return None
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept_claims = []
+        abstained_by_split = False
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str):
+                continue
+
+            if ctx.saw(text):
+                kept_claims.append(claim)
+                continue
+
+            split_result = self._try_split_contradiction(text, ctx)
+            if split_result:
+                kept_claims.extend(split_result)
+                abstained_by_split = True
+
+        if abstained_by_split:
+            report["abstain"] = True
+
+        if not kept_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong các tài liệu nội bộ đã đọc để đưa ra kết luận chắc chắn."
+            return report
+
+        report["claims"] = kept_claims
+        report["citations"] = sorted({c["doc_id"] for c in kept_claims if c.get("doc_id")})
+        return report
